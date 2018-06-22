@@ -1,25 +1,28 @@
 ﻿using Dapper;
+using Newtonsoft.Json;
+using PushoverClient;
 using System;
+using System.Collections.Generic;
+using System.Data.SQLite;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Linq;
-using PushoverClient;
-using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
-using System.IO;
-using Newtonsoft.Json;
-using System.Data.SQLite;
-using Telegram.Bot.Types;
 using Telegram.Bot;
+using Telegram.Bot.Types;
 
 namespace ft8push
 {
     class Program
     {
+#warning Detect this from WSJT-X at runtime
+        const int band = 50;
+
         class Match
         {
             public override string ToString()
@@ -101,6 +104,9 @@ namespace ft8push
 
         static void N1mmListener()
         {
+//#warning Temporary exclusion
+            //AddLogEntryToWorkedBandSquares("ON8DM", 50);
+
             while (true)
             {
                 var listener = new UdpClient(new IPEndPoint(IPAddress.Any, 12060));
@@ -122,15 +128,44 @@ namespace ft8push
             }
         }
 
+        static void ProcessQueue()
+        {
+            while (true)
+            {
+                byte[] msg = null;
+                lock (n1mmBuffer)
+                {
+                    if (n1mmBuffer.Count > 0)
+                    {
+                         msg = n1mmBuffer.Dequeue();
+                    }
+                }
+
+                if (msg != null)
+                {
+                    if (N1mmXmlContactReplace.TryParse(msg, out N1mmXmlContactReplace cr))
+                    {
+                        ProcessContactReplace(cr);
+                    }
+                    else if (N1mmXmlContactInfo.TryParse(msg, out N1mmXmlContactInfo ci))
+                    {
+                        ProcessContactAdd(ci);
+                    }
+                }
+                else
+                {
+                    Thread.Sleep(1000);
+                }
+            }
+        }
+        
+        static Queue<byte[]> n1mmBuffer = new Queue<byte[]>();
+
         static void ProcessDatagram(byte[] msg)
         {
-            if (N1mmXmlContactReplace.TryParse(msg, out N1mmXmlContactReplace cr))
+            lock (n1mmBuffer)
             {
-                ProcessContactReplace(cr);
-            }
-            else if (N1mmXmlContactInfo.TryParse(msg, out N1mmXmlContactInfo ci))
-            {
-                ProcessContactAdd(ci);
+                n1mmBuffer.Enqueue(msg);
             }
         }
 
@@ -173,10 +208,13 @@ namespace ft8push
 
             var m = matches.Single();
 
-            if (!BandSquares.Any(mem => mem.Band == band && mem.Prefix == m.PrimaryPrefix))
+            lock (BandSquares)
             {
-                Console.WriteLine($"Adding band square {m.CountryName} ({m.PrimaryPrefix}) / {band}MHz");
-                BandSquares.Add(new BandSquare { Band = band, Country = m.CountryName, Prefix = m.PrimaryPrefix });
+                if (!BandSquares.Any(mem => mem.Band == band && mem.Prefix == m.PrimaryPrefix))
+                {
+                    Console.WriteLine($"Adding band square {m.CountryName} ({m.PrimaryPrefix}) / {band}MHz");
+                    BandSquares.Add(new BandSquare { Band = band, Country = m.CountryName, Prefix = m.PrimaryPrefix });
+                }
             }
         }
 
@@ -185,6 +223,8 @@ namespace ft8push
             Task.Factory.StartNew(SpotPusher, TaskCreationOptions.LongRunning);
 
             Task.Factory.StartNew(N1mmListener, TaskCreationOptions.LongRunning);
+
+            Task.Factory.StartNew(ProcessQueue, TaskCreationOptions.LongRunning);
 
             using (var client = new UdpClient(2237, AddressFamily.InterNetwork))
             {
@@ -202,30 +242,10 @@ namespace ft8push
 
                     if (msg[11] == 0x02)
                     {
-                        string text;
-                        try
-                        {
-                            text = Encoding.ASCII.GetString(msg.Skip(52).SkipLast(2).ToArray());
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine(ex);
+                        string heardCall = GetHeardCall(msg);
+
+                        if (heardCall == null)
                             continue;
-                        }
-
-                        if (string.IsNullOrWhiteSpace(text))
-                        {
-                            continue;
-                        }
-
-                        string[] split = text.Split(' ');
-
-                        if (split.Length != 3)
-                        {
-                            continue;
-                        }
-
-                        string heardCall = split[1];
 
                         const int tolerateSecsLate = 2;
                         int slotSec;
@@ -254,14 +274,17 @@ namespace ft8push
                             quantisedNow = quantisedNow.Subtract(TimeSpan.FromSeconds(1));
                         }
 
-#warning Detect this from WSJT-X at runtime
-                        int band = 14;
-
                         var matches = GetMatches(heardCall);
                         
                         if (matches.Count == 1)
                         {
-                            if (!BandSquares.Any(b => b.Band == band && b.Prefix == matches.Single().PrimaryPrefix))
+                            bool found;
+                            lock (BandSquares)
+                            {
+                                found = BandSquares.Any(b => b.Band == band && b.Prefix == matches.Single().PrimaryPrefix);
+                            }
+
+                            if (!found)
                             {
                                 if (quantisedNow != lastQuantisedNow)
                                 {
@@ -271,7 +294,7 @@ namespace ft8push
 
                                 string mtch = String.Join(" or ", matches.Select(m => $"{m.CountryName} ({m.PrimaryPrefix})"));
 
-                                SendTelegram($"{heardCall} - {mtch}");
+                                SendTelegram($"{band}MHz - {heardCall} - {mtch}");
 
                                 Console.ForegroundColor = ConsoleColor.White;
                                 Console.Write($"{heardCall}");
@@ -364,6 +387,36 @@ namespace ft8push
             }
         }
 
+        static string GetHeardCall(byte[] msg)
+        {
+            string text;
+            try
+            {
+                text = Encoding.ASCII.GetString(msg.Skip(52).SkipLast(2).ToArray());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex);
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            string[] split = text.Split(' ');
+
+            if (split.Length != 3)
+            {
+                return null;
+            }
+
+            string heardCall = split[1];
+
+            return heardCall;
+        }
+
         static void SendTelegram(string msg)
         {
             try
@@ -409,9 +462,12 @@ namespace ft8push
 
                 var m = matches.Single();
 
-                if (!BandSquares.Any(mem => mem.Band == dbrow.Band && mem.Prefix == m.PrimaryPrefix))
+                lock (BandSquares)
                 {
-                    BandSquares.Add(new BandSquare { Band = dbrow.Band, Country = m.CountryName, Prefix = m.PrimaryPrefix });
+                    if (!BandSquares.Any(mem => mem.Band == dbrow.Band && mem.Prefix == m.PrimaryPrefix))
+                    {
+                        BandSquares.Add(new BandSquare { Band = dbrow.Band, Country = m.CountryName, Prefix = m.PrimaryPrefix });
+                    }
                 }
             }
         }
